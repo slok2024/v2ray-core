@@ -10,6 +10,7 @@ import (
 
 	"github.com/v2fly/v2ray-core/v5/common"
 	"github.com/v2fly/v2ray-core/v5/common/net"
+	http_proto "github.com/v2fly/v2ray-core/v5/common/protocol/http"
 	"github.com/v2fly/v2ray-core/v5/transport/internet"
 	"github.com/v2fly/v2ray-core/v5/transport/internet/transportcommon"
 )
@@ -29,7 +30,18 @@ func (s *server) Addr() net.Addr {
 	return nil
 }
 
-func (s *server) Handle(conn net.Conn) (internet.Connection, error) {
+func (s *server) Handle(conn net.Conn) {
+	upgradedConn, err := s.upgrade(conn)
+	if err != nil {
+		conn.Close()
+		newError("failed to handle request").Base(err).WriteToLog()
+		return
+	}
+	s.addConn(upgradedConn)
+}
+
+// upgrade execute a fake websocket upgrade process and return the available connection
+func (s *server) upgrade(conn net.Conn) (internet.Connection, error) {
 	connReader := bufio.NewReader(conn)
 	req, err := http.ReadRequest(connReader)
 	if err != nil {
@@ -56,6 +68,14 @@ func (s *server) Handle(conn net.Conn) (internet.Connection, error) {
 		_ = conn.Close()
 		return nil, err
 	}
+	forwardedAddrs := http_proto.ParseXForwardedFor(req.Header)
+	remoteAddr := conn.RemoteAddr()
+	if s.config.ParseXForwardedFor && len(forwardedAddrs) > 0 && forwardedAddrs[0].Family().IsIP() {
+		remoteAddr = &net.TCPAddr{
+			IP:   forwardedAddrs[0].IP(),
+			Port: int(0),
+		}
+	}
 	if s.config.MaxEarlyData != 0 {
 		if s.config.EarlyDataHeaderName == "" {
 			return nil, newError("EarlyDataHeaderName is not set")
@@ -66,10 +86,10 @@ func (s *server) Handle(conn net.Conn) (internet.Connection, error) {
 			if err != nil {
 				return nil, err
 			}
-			return newConnectionWithPendingRead(conn, conn.RemoteAddr(), bytes.NewReader(earlyDataBytes)), nil
+			return newConnectionWithPendingRead(conn, remoteAddr, bytes.NewReader(earlyDataBytes)), nil
 		}
 	}
-	return internet.Connection(conn), nil
+	return newConnectionWithRemoteAddr(conn, remoteAddr), nil
 }
 
 func (s *server) keepAccepting() {
@@ -78,12 +98,7 @@ func (s *server) keepAccepting() {
 		if err != nil {
 			return
 		}
-		handledConn, err := s.Handle(conn)
-		if err != nil {
-			newError("failed to handle request").Base(err).WriteToLog()
-			continue
-		}
-		s.addConn(handledConn)
+		go s.Handle(conn)
 	}
 }
 
